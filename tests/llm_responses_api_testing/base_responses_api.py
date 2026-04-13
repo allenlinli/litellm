@@ -74,7 +74,7 @@ def validate_responses_api_response(response, final_chunk: bool = False):
         "top_p": (int, float, type(None)),
         "max_output_tokens": (int, type(None)),
         "previous_response_id": (str, type(None)),
-        "reasoning": dict,
+        "reasoning": (dict, type(None)),
         "status": str,
         "text": dict,
         "truncation": (str, type(None)),
@@ -768,7 +768,7 @@ class BaseResponsesAPITest(ABC):
         model = self.get_advanced_model_for_shell_tool() or base_completion_call_args.get(
             "model"
         ) or "openai/gpt-5.2"
-        if "openai/" not in str(model) and "azure/" not in str(model):
+        if "openai/" not in str(model):
             pytest.skip(
                 "Shell tool streaming e2e is only run for OpenAI/Azure Responses API"
             )

@@ -138,6 +138,35 @@ class TestResponsesAPIRequestUtils:
         assert decoded.get("model_id") == "gpt-4o"
         assert decoded.get("custom_llm_provider") == "openai"
 
+    def test_build_decode_container_id_omits_none_model_id(self):
+        """model_id=None must not round-trip as the truthy string 'None'."""
+        encoded = ResponsesAPIRequestUtils._build_container_id(
+            custom_llm_provider="azure",
+            model_id=None,
+            container_id="cntr_upstream_abc",
+        )
+        assert "None" not in base64.b64decode(
+            encoded.replace("cntr_", "").encode("utf-8")
+        ).decode("utf-8")
+        decoded = ResponsesAPIRequestUtils._decode_container_id(encoded)
+        assert decoded.get("custom_llm_provider") == "azure"
+        assert decoded.get("model_id") is None
+        assert decoded.get("response_id") == "cntr_upstream_abc"
+
+    def test_decode_container_id_legacy_literal_none_model_id(self):
+        """IDs encoded before the None fix should decode without a bogus model_id."""
+        legacy_inner = (
+            "litellm:custom_llm_provider:azure;model_id:None;container_id:cntr_x"
+        )
+        legacy_id = (
+            "cntr_"
+            + base64.b64encode(legacy_inner.encode("utf-8")).decode("utf-8")
+        )
+        decoded = ResponsesAPIRequestUtils._decode_container_id(legacy_id)
+        assert decoded.get("model_id") is None
+        assert decoded.get("custom_llm_provider") == "azure"
+        assert decoded.get("response_id") == "cntr_x"
+
 
 class TestResponseAPILoggingUtils:
     def test_is_response_api_usage_true(self):
@@ -383,4 +412,36 @@ def test_responses_extra_body_forwarded_to_completion_transformation_handler():
         # extra_body can be a positional or keyword arg; check both
         assert call_kwargs.kwargs.get("extra_body") == {
             "custom_key": "custom_value"
+        }
+
+
+def test_responses_maps_reasoning_effort_from_litellm_params_to_reasoning():
+    """
+    Test that when reasoning_effort is passed in kwargs (e.g. from proxy litellm_params)
+    and reasoning is None, it is mapped to reasoning before the request.
+
+    Supports per-model reasoning_effort/summary config in proxy for clients like Open WebUI
+    that cannot set extra_body.
+    """
+    with patch(
+        "litellm.responses.main.ProviderConfigManager.get_provider_responses_api_config",
+        return_value=None,
+    ), patch(
+        "litellm.responses.main.litellm_completion_transformation_handler.response_api_handler",
+    ) as mock_handler:
+        mock_handler.return_value = MagicMock()
+
+        litellm.responses(
+            model="openai/gpt-4o",
+            input="Hello",
+            reasoning_effort={"effort": "high", "summary": "detailed"},
+        )
+
+        mock_handler.assert_called_once()
+        call_kwargs = mock_handler.call_args
+        responses_api_request = call_kwargs.kwargs.get("responses_api_request", {})
+        assert "reasoning" in responses_api_request
+        assert responses_api_request["reasoning"] == {
+            "effort": "high",
+            "summary": "detailed",
         }

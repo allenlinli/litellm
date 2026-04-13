@@ -3,7 +3,7 @@ import copy
 import json
 import os
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import Request
@@ -13,13 +13,18 @@ from litellm.proxy._types import TeamCallbackMetadata, UserAPIKeyAuth
 from litellm.proxy.litellm_pre_call_utils import (
     KeyAndTeamLoggingSettings,
     LiteLLMProxyRequestSetup,
+    _apply_credential_overrides_from_model_config,
+    _extract_credential_from_entry,
     _get_dynamic_logging_metadata,
     _get_enforced_params,
+    _get_metadata_variable_name,
+    _resolve_credential_from_model_config,
     _update_model_if_key_alias_exists,
     add_guardrails_from_policy_engine,
     add_litellm_data_to_request,
     check_if_token_is_service_account,
 )
+from litellm.types.utils import CredentialItem
 
 sys.path.insert(
     0, os.path.abspath("../../..")
@@ -45,6 +50,47 @@ def test_check_if_token_is_service_account():
         api_key="test-key", metadata={"user_id": "test-user"}
     )
     assert check_if_token_is_service_account(other_metadata_token) == False
+
+
+class TestGetMetadataVariableName:
+    """Tests for _get_metadata_variable_name()"""
+
+    def _make_request(self, path: str) -> MagicMock:
+        request = MagicMock(spec=Request)
+        request.url.path = path
+        return request
+
+    def test_returns_litellm_metadata_for_thread_routes(self):
+        request = self._make_request("/v1/threads/thread_123/messages")
+        assert _get_metadata_variable_name(request) == "litellm_metadata"
+
+    def test_returns_litellm_metadata_for_assistant_routes(self):
+        request = self._make_request("/v1/assistants/asst_123")
+        assert _get_metadata_variable_name(request) == "litellm_metadata"
+
+    def test_returns_litellm_metadata_for_batches_route(self):
+        request = self._make_request("/v1/batches")
+        assert _get_metadata_variable_name(request) == "litellm_metadata"
+
+    def test_returns_litellm_metadata_for_messages_route(self):
+        request = self._make_request("/v1/messages")
+        assert _get_metadata_variable_name(request) == "litellm_metadata"
+
+    def test_returns_litellm_metadata_for_files_route(self):
+        request = self._make_request("/v1/files")
+        assert _get_metadata_variable_name(request) == "litellm_metadata"
+
+    def test_returns_metadata_for_chat_completions(self):
+        request = self._make_request("/chat/completions")
+        assert _get_metadata_variable_name(request) == "metadata"
+
+    def test_returns_metadata_for_completions(self):
+        request = self._make_request("/v1/completions")
+        assert _get_metadata_variable_name(request) == "metadata"
+
+    def test_returns_metadata_for_embeddings(self):
+        request = self._make_request("/v1/embeddings")
+        assert _get_metadata_variable_name(request) == "metadata"
 
 
 def test_get_enforced_params_for_service_account_settings():
@@ -1014,91 +1060,136 @@ async def test_add_litellm_metadata_from_request_headers():
     # Set up test logger
     litellm._turn_on_debug()
     test_logger = TestCustomLogger()
+    original_callbacks = litellm.callbacks
     litellm.callbacks = [test_logger]
 
-    # Prepare test data (ensure no streaming, add mock_response and api_key to route to litellm.acompletion)
-    headers = {"x-litellm-spend-logs-metadata": '{"user_id": "12345", "project_id": "proj_abc", "request_type": "chat_completion", "timestamp": "2025-09-02T10:30:00Z"}'}
-    data = {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}], "stream": False, "mock_response": "Hi", "api_key": "fake-key"}
-    
-    # Create mock request with headers
-    mock_request = MagicMock(spec=Request)
-    mock_request.headers = headers
-    mock_request.url.path = "/chat/completions"
-    
-    # Create mock response
-    mock_fastapi_response = MagicMock(spec=Response)
-    
-    # Create mock user API key dict
-    mock_user_api_key_dict = UserAPIKeyAuth(
-        api_key="test-key",
-        user_id="test-user",
-        org_id="test-org"
+    try:
+        # Prepare test data (ensure no streaming, add mock_response and api_key to route to litellm.acompletion)
+        headers = {"x-litellm-spend-logs-metadata": '{"user_id": "12345", "project_id": "proj_abc", "request_type": "chat_completion", "timestamp": "2025-09-02T10:30:00Z"}'}
+        data = {"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}], "stream": False, "mock_response": "Hi", "api_key": "fake-key"}
+
+        # Create mock request with headers
+        mock_request = MagicMock(spec=Request)
+        mock_request.headers = headers
+        mock_request.url.path = "/chat/completions"
+
+        # Create mock response
+        mock_fastapi_response = MagicMock(spec=Response)
+
+        # Create mock user API key dict
+        mock_user_api_key_dict = UserAPIKeyAuth(
+            api_key="test-key",
+            user_id="test-user",
+            org_id="test-org"
+        )
+
+        # Create mock proxy logging object
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+
+        # Create async functions for the hooks
+        async def mock_during_call_hook(*args, **kwargs):
+            return None
+
+        async def mock_pre_call_hook(*args, **kwargs):
+            return data
+
+        async def mock_post_call_success_hook(*args, **kwargs):
+            # Return the response unchanged
+            return kwargs.get('response', args[2] if len(args) > 2 else None)
+
+        mock_proxy_logging_obj.during_call_hook = mock_during_call_hook
+        mock_proxy_logging_obj.pre_call_hook = mock_pre_call_hook
+        mock_proxy_logging_obj.post_call_success_hook = mock_post_call_success_hook
+
+        # Create mock proxy config
+        mock_proxy_config = MagicMock()
+
+        # Create mock general settings
+        general_settings = {}
+
+        # Create mock select_data_generator with correct signature
+        def mock_select_data_generator(response=None, user_api_key_dict=None, request_data=None):
+            async def mock_generator():
+                yield "data: " + json.dumps({"choices": [{"delta": {"content": "Hello"}}]}) + "\n\n"
+                yield "data: [DONE]\n\n"
+            return mock_generator()
+
+        # Create the processor
+        processor = ProxyBaseLLMRequestProcessing(data=data)
+
+        # Call base_process_llm_request (it will use the mock_response="Hi" parameter)
+        result = await processor.base_process_llm_request(
+            request=mock_request,
+            fastapi_response=mock_fastapi_response,
+            user_api_key_dict=mock_user_api_key_dict,
+            route_type="acompletion",
+            proxy_logging_obj=mock_proxy_logging_obj,
+            general_settings=general_settings,
+            proxy_config=mock_proxy_config,
+            select_data_generator=mock_select_data_generator,
+            llm_router=None,
+            model="gpt-4",
+            is_streaming_request=False
+        )
+
+        # Sleep for 3 seconds to allow logging to complete
+        await asyncio.sleep(3)
+
+        # Check if standard_logging_object was set
+        assert test_logger.standard_logging_object is not None, "standard_logging_object should be populated after LLM request"
+
+        # Verify the logging object contains expected metadata
+        standard_logging_obj = test_logger.standard_logging_object
+
+        print(f"Standard logging object captured: {json.dumps(standard_logging_obj, indent=4, default=str)}")
+
+        SPEND_LOGS_METADATA = standard_logging_obj["metadata"]["spend_logs_metadata"]
+        assert SPEND_LOGS_METADATA == dict(json.loads(headers["x-litellm-spend-logs-metadata"])), "spend_logs_metadata should be the same as the headers"
+    finally:
+        litellm.callbacks = original_callbacks
+
+
+def test_add_litellm_metadata_from_request_headers_x_litellm_trace_id_sets_chain_id():
+    """x-litellm-trace-id sets both metadata and top-level litellm_session_id/litellm_trace_id for call chaining."""
+    headers = {"x-litellm-trace-id": "foo"}
+    data = {"metadata": {}}
+    LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+        headers=headers, data=data, _metadata_variable_name="metadata"
     )
-    
-    # Create mock proxy logging object
-    mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
-    
-    # Create async functions for the hooks
-    async def mock_during_call_hook(*args, **kwargs):
-        return None
-        
-    async def mock_pre_call_hook(*args, **kwargs):
-        return data
-        
-    async def mock_post_call_success_hook(*args, **kwargs):
-        # Return the response unchanged
-        return kwargs.get('response', args[2] if len(args) > 2 else None)
-        
-    mock_proxy_logging_obj.during_call_hook = mock_during_call_hook
-    mock_proxy_logging_obj.pre_call_hook = mock_pre_call_hook
-    mock_proxy_logging_obj.post_call_success_hook = mock_post_call_success_hook
-    
-    # Create mock proxy config
-    mock_proxy_config = MagicMock()
-    
-    # Create mock general settings
-    general_settings = {}
-    
-    # Create mock select_data_generator with correct signature
-    def mock_select_data_generator(response=None, user_api_key_dict=None, request_data=None):
-        async def mock_generator():
-            yield "data: " + json.dumps({"choices": [{"delta": {"content": "Hello"}}]}) + "\n\n"
-            yield "data: [DONE]\n\n"
-        return mock_generator()
-    
-    # Create the processor
-    processor = ProxyBaseLLMRequestProcessing(data=data)
-    
-    # Call base_process_llm_request (it will use the mock_response="Hi" parameter)
-    result = await processor.base_process_llm_request(
-        request=mock_request,
-        fastapi_response=mock_fastapi_response,
-        user_api_key_dict=mock_user_api_key_dict,
-        route_type="acompletion",
-        proxy_logging_obj=mock_proxy_logging_obj,
-        general_settings=general_settings,
-        proxy_config=mock_proxy_config,
-        select_data_generator=mock_select_data_generator,
-        llm_router=None,
-        model="gpt-4",
-        is_streaming_request=False
+    assert data["metadata"]["trace_id"] == "foo"
+    assert data["metadata"]["session_id"] == "foo"
+    assert data["litellm_session_id"] == "foo"
+    assert data["litellm_trace_id"] == "foo"
+
+
+def test_add_litellm_metadata_from_request_headers_x_litellm_session_id_sets_chain_id():
+    """x-litellm-session-id sets both metadata and top-level litellm_session_id/litellm_trace_id for call chaining."""
+    headers = {"x-litellm-session-id": "bar"}
+    data = {"metadata": {}}
+    LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+        headers=headers, data=data, _metadata_variable_name="metadata"
     )
-    
-    # Sleep for 3 seconds to allow logging to complete
-    await asyncio.sleep(3)
-    
-    # Check if standard_logging_object was set
-    assert test_logger.standard_logging_object is not None, "standard_logging_object should be populated after LLM request"
-    
-    # Verify the logging object contains expected metadata
-    standard_logging_obj = test_logger.standard_logging_object
+    assert data["metadata"]["trace_id"] == "bar"
+    assert data["metadata"]["session_id"] == "bar"
+    assert data["litellm_session_id"] == "bar"
+    assert data["litellm_trace_id"] == "bar"
 
-    print(f"Standard logging object captured: {json.dumps(standard_logging_obj, indent=4, default=str)}")
 
-    SPEND_LOGS_METADATA = standard_logging_obj["metadata"]["spend_logs_metadata"]
-    assert SPEND_LOGS_METADATA == dict(json.loads(headers["x-litellm-spend-logs-metadata"])), "spend_logs_metadata should be the same as the headers"
+def test_add_litellm_metadata_from_request_headers_both_headers_trace_id_precedence():
+    """When both x-litellm-trace-id and x-litellm-session-id are present, trace-id takes precedence for chain_id."""
+    headers = {
+        "x-litellm-trace-id": "trace-value",
+        "x-litellm-session-id": "session-value",
+    }
+    data = {"metadata": {}}
+    LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+        headers=headers, data=data, _metadata_variable_name="metadata"
+    )
+    assert data["metadata"]["trace_id"] == "trace-value"
+    assert data["metadata"]["session_id"] == "trace-value"
+    assert data["litellm_session_id"] == "trace-value"
+    assert data["litellm_trace_id"] == "trace-value"
 
-        
 
 def test_get_internal_user_header_from_mapping_returns_expected_header():
     mappings = [
@@ -1276,6 +1367,101 @@ async def test_request_guardrails_do_not_override_key_guardrails():
     assert len(requested_guardrails) == 1
 
 
+@pytest.mark.asyncio
+async def test_project_guardrails_merge_with_key_and_team():
+    """
+    Test that project guardrails are merged with key and team guardrails (union semantics).
+    All three levels should contribute to the final guardrails list without duplicates.
+    """
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "test"}],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        metadata={"guardrails": ["key-guardrail-1"]},
+        team_metadata={"guardrails": ["team-guardrail-1", "key-guardrail-1"]},
+        project_metadata={"guardrails": ["project-guardrail-1", "team-guardrail-1"]},
+    )
+
+    with patch("litellm.proxy.utils._premium_user_check"):
+        updated_data = await add_litellm_data_to_request(
+            data=data,
+            request=request_mock,
+            user_api_key_dict=user_api_key_dict,
+            proxy_config=MagicMock(),
+            general_settings={},
+            version="test-version",
+        )
+
+    metadata = updated_data.get("metadata", {})
+    guardrails = metadata.get("guardrails", [])
+
+    # All three sources contribute
+    assert "key-guardrail-1" in guardrails
+    assert "team-guardrail-1" in guardrails
+    assert "project-guardrail-1" in guardrails
+    # No duplicates
+    assert guardrails.count("key-guardrail-1") == 1
+    assert guardrails.count("team-guardrail-1") == 1
+
+
+@pytest.mark.asyncio
+async def test_project_guardrails_only():
+    """
+    Test that project guardrails work when key and team have no guardrails configured.
+    """
+    request_mock = MagicMock(spec=Request)
+    request_mock.url.path = "/chat/completions"
+    request_mock.url = MagicMock()
+    request_mock.url.__str__.return_value = "http://localhost/chat/completions"
+    request_mock.method = "POST"
+    request_mock.query_params = {}
+    request_mock.headers = {"Content-Type": "application/json"}
+    request_mock.client = MagicMock()
+    request_mock.client.host = "127.0.0.1"
+
+    data = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "test"}],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        metadata={},
+        team_metadata={},
+        project_metadata={"guardrails": ["project-guardrail-1", "project-guardrail-2"]},
+    )
+
+    with patch("litellm.proxy.utils._premium_user_check"):
+        updated_data = await add_litellm_data_to_request(
+            data=data,
+            request=request_mock,
+            user_api_key_dict=user_api_key_dict,
+            proxy_config=MagicMock(),
+            general_settings={},
+            version="test-version",
+        )
+
+    metadata = updated_data.get("metadata", {})
+    guardrails = metadata.get("guardrails", [])
+
+    assert "project-guardrail-1" in guardrails
+    assert "project-guardrail-2" in guardrails
+    assert len(guardrails) == 2
+
+
 def test_update_model_if_key_alias_exists():
     """
     Test that _update_model_if_key_alias_exists properly updates the model when a key alias exists.
@@ -1347,7 +1533,17 @@ async def test_embedding_header_forwarding_with_model_group():
     This test verifies the fix for embedding endpoints not forwarding headers
     similar to how chat completion endpoints do.
     """
-    import litellm
+    import importlib
+
+    import litellm.proxy.litellm_pre_call_utils as pre_call_utils_module
+
+    # Reload the module to ensure it has a fresh reference to litellm
+    # This is necessary because conftest.py reloads litellm at module scope,
+    # which can cause the module's litellm reference to become stale
+    importlib.reload(pre_call_utils_module)
+
+    # Re-import the function after reload to get the fresh version
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
 
     # Setup mock request for embeddings
     request_mock = MagicMock(spec=Request)
@@ -1379,11 +1575,10 @@ async def test_embedding_header_forwarding_with_model_group():
     )
 
     # Mock model_group_settings to enable header forwarding for the model
+    # Use string-based patch to ensure we patch the current sys.modules['litellm']
+    # This avoids issues with module reloading during parallel test execution
     mock_settings = MagicMock(forward_client_headers_to_llm_api=["local-openai/*"])
-    original_model_group_settings = getattr(litellm, "model_group_settings", None)
-    litellm.model_group_settings = mock_settings
-
-    try:
+    with patch("litellm.model_group_settings", mock_settings):
         # Call add_litellm_data_to_request which includes header forwarding logic
         updated_data = await add_litellm_data_to_request(
             data=data,
@@ -1396,27 +1591,23 @@ async def test_embedding_header_forwarding_with_model_group():
 
         # Verify that headers were added to the request data
         assert "headers" in updated_data, "Headers should be added to embedding request"
-        
+
         # Verify that only x- prefixed headers (except x-stainless) were forwarded
         forwarded_headers = updated_data["headers"]
         assert "X-Custom-Header" in forwarded_headers, "X-Custom-Header should be forwarded"
         assert forwarded_headers["X-Custom-Header"] == "custom-value"
         assert "X-Request-ID" in forwarded_headers, "X-Request-ID should be forwarded"
         assert forwarded_headers["X-Request-ID"] == "test-request-123"
-        
+
         # Verify that authorization header was NOT forwarded (sensitive header)
         assert "Authorization" not in forwarded_headers, "Authorization header should not be forwarded"
-        
+
         # Verify that Content-Type was NOT forwarded (doesn't start with x-)
         assert "Content-Type" not in forwarded_headers, "Content-Type should not be forwarded"
 
         # Verify original data fields are preserved
         assert updated_data["model"] == "local-openai/text-embedding-3-small"
         assert updated_data["input"] == ["Text to embed"]
-
-    finally:
-        # Restore original model_group_settings
-        litellm.model_group_settings = original_model_group_settings
 
 
 @pytest.mark.asyncio
@@ -1480,7 +1671,8 @@ async def test_embedding_header_forwarding_without_model_group_config():
         litellm.model_group_settings = original_model_group_settings
 
 
-def test_add_guardrails_from_policy_engine():
+@pytest.mark.asyncio
+async def test_add_guardrails_from_policy_engine():
     """
     Test that add_guardrails_from_policy_engine adds guardrails from matching policies
     and tracks applied policies in metadata.
@@ -1527,7 +1719,7 @@ def test_add_guardrails_from_policy_engine():
     attachment_registry._initialized = True
 
     # Call the function
-    add_guardrails_from_policy_engine(
+    await add_guardrails_from_policy_engine(
         data=data,
         metadata_variable_name="metadata",
         user_api_key_dict=user_api_key_dict,
@@ -1550,11 +1742,12 @@ def test_add_guardrails_from_policy_engine():
     attachment_registry._initialized = False
 
 
-def test_add_guardrails_from_policy_engine_accepts_dynamic_policies_and_pops_from_data():
+@pytest.mark.asyncio
+async def test_add_guardrails_from_policy_engine_accepts_dynamic_policies_and_pops_from_data():
     """
     Test that add_guardrails_from_policy_engine accepts dynamic 'policies' from the request body
     and removes them to prevent forwarding to the LLM provider.
-    
+
     This is critical because 'policies' is a LiteLLM proxy-specific parameter that should
     not be sent to the actual LLM API (e.g., OpenAI, Anthropic, etc.).
     """
@@ -1580,7 +1773,7 @@ def test_add_guardrails_from_policy_engine_accepts_dynamic_policies_and_pops_fro
     policy_registry._initialized = False
 
     # Call the function - should accept dynamic policies and not raise an error
-    add_guardrails_from_policy_engine(
+    await add_guardrails_from_policy_engine(
         data=data,
         metadata_variable_name="metadata",
         user_api_key_dict=user_api_key_dict,
@@ -1595,3 +1788,670 @@ def test_add_guardrails_from_policy_engine_accepts_dynamic_policies_and_pops_fro
     assert "messages" in data
     assert data["messages"] == [{"role": "user", "content": "Hello"}]
     assert "metadata" in data
+
+
+@pytest.mark.asyncio
+async def test_add_guardrails_from_policy_engine_policy_version_by_id():
+    """
+    Test that add_guardrails_from_policy_engine executes a specific policy version
+    when policy_<uuid> is passed in the request body.
+    """
+    from litellm.proxy.policy_engine.attachment_registry import get_attachment_registry
+    from litellm.proxy.policy_engine.policy_registry import get_policy_registry
+    from litellm.types.proxy.policy_engine import Policy, PolicyGuardrails
+
+    policy_version_uuid = "12345678-1234-5678-1234-567812345678"
+    policy_version_ref = f"policy_{policy_version_uuid}"
+
+    # Policy from the specific version (e.g. published) - different guardrail than production
+    published_version_policy = Policy(
+        guardrails=PolicyGuardrails(add=["published_version_guardrail"]),
+    )
+
+    data = {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "policies": [policy_version_ref],
+        "metadata": {},
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_alias="test-team",
+        key_alias="test-key",
+    )
+
+    policy_registry = get_policy_registry()
+    policy_registry._policies = {}
+    policy_registry._initialized = True
+
+    attachment_registry = get_attachment_registry()
+    attachment_registry._attachments = []
+    attachment_registry._initialized = True
+
+    with patch.object(
+        policy_registry,
+        "get_policy_by_id_for_request",
+        return_value=("test-policy-from-version", published_version_policy),
+    ):
+        await add_guardrails_from_policy_engine(
+            data=data,
+            metadata_variable_name="metadata",
+            user_api_key_dict=user_api_key_dict,
+        )
+
+    # Verify guardrails from the specific version were applied
+    assert "metadata" in data
+    assert "guardrails" in data["metadata"]
+    assert "published_version_guardrail" in data["metadata"]["guardrails"]
+    assert "policies" not in data
+
+    # Clean up
+    policy_registry._policies = {}
+    policy_registry._initialized = False
+
+
+@pytest.mark.asyncio
+async def test_bearer_token_not_in_debug_logs():
+    """
+    E2E regression test for the client-reported JWT leak.
+
+    Calls add_litellm_data_to_request with a Bearer token in the request
+    headers and captures all debug log output. Asserts the raw token never
+    appears in any log message — covering the exact paths the client reported:
+      - "Request Headers: ..."
+      - "receiving data: ..."
+      - "[PROXY] returned data from litellm_pre_call_utils: ..."
+    """
+    import logging
+    from io import StringIO
+
+    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+    from litellm.proxy.proxy_server import ProxyConfig
+
+    secret_token = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.fakesignature"
+
+    mock_request = MagicMock(spec=Request)
+    mock_request.headers = {
+        "authorization": f"Bearer {secret_token}",
+        "content-type": "application/json",
+    }
+    mock_request.url = MagicMock()
+    mock_request.url.__str__ = lambda self: "http://localhost:4000/v1/chat/completions"
+    mock_request.method = "POST"
+    mock_request.query_params = {}
+
+    data = {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    user_api_key_dict = UserAPIKeyAuth(api_key="sk-1234")
+
+    # Capture all debug log output from the proxy logger
+    log_capture = StringIO()
+    log_handler = logging.StreamHandler(log_capture)
+    log_handler.setLevel(logging.DEBUG)
+    logger = logging.getLogger("LiteLLM Proxy")
+    logger.addHandler(log_handler)
+    original_level = logger.level
+    logger.setLevel(logging.DEBUG)
+
+    try:
+        with patch("litellm.proxy.proxy_server.llm_router", None), \
+             patch("litellm.proxy.proxy_server.premium_user", True):
+            await add_litellm_data_to_request(
+                data=data,
+                request=mock_request,
+                user_api_key_dict=user_api_key_dict,
+                proxy_config=ProxyConfig(),
+                general_settings={},
+            )
+    finally:
+        logger.removeHandler(log_handler)
+        logger.setLevel(original_level)
+
+    log_output = log_capture.getvalue()
+    assert secret_token not in log_output, (
+        f"Bearer token leaked in debug logs. "
+        f"Found token in log output:\n{log_output[:500]}"
+    )
+
+
+# ============================================================================
+# Tests for credential overrides from model_config (team/project metadata)
+# ============================================================================
+
+
+@pytest.fixture()
+def setup_test_credentials():
+    """Populate litellm.credential_list with test credentials and enable feature flag, clean up after."""
+    original = litellm.credential_list[:]
+    original_flag = litellm.enable_model_config_credential_overrides
+    litellm.enable_model_config_credential_overrides = True
+    litellm.credential_list.extend(
+        [
+            CredentialItem(
+                credential_name="hotel-azure-eastus",
+                credential_info={},
+                credential_values={
+                    "api_base": "https://hotel-eastus.openai.azure.com/",
+                    "api_key": "key-hotel-eastus",
+                },
+            ),
+            CredentialItem(
+                credential_name="hotel-azure-westus",
+                credential_info={},
+                credential_values={
+                    "api_base": "https://hotel-westus.openai.azure.com/",
+                    "api_key": "key-hotel-westus",
+                },
+            ),
+            CredentialItem(
+                credential_name="hotel-rec-azure",
+                credential_info={},
+                credential_values={
+                    "api_base": "https://hotel-rec-app.openai.azure.com/",
+                    "api_key": "key-hotel-rec",
+                },
+            ),
+            CredentialItem(
+                credential_name="hotel-rec-vision",
+                credential_info={},
+                credential_values={
+                    "api_base": "https://hotel-rec-vision.openai.azure.com/",
+                    "api_key": "key-hotel-rec-vision",
+                    "api_version": "2024-06-01",
+                },
+            ),
+            CredentialItem(
+                credential_name="flight-azure-centralus",
+                credential_info={},
+                credential_values={
+                    "api_base": "https://flight-centralus.openai.azure.com/",
+                    "api_key": "key-flight-centralus",
+                },
+            ),
+        ]
+    )
+    yield
+    litellm.credential_list[:] = original
+    litellm.enable_model_config_credential_overrides = original_flag
+
+
+# --- Unit tests for _extract_credential_from_entry ---
+
+
+def test_extract_credential_from_entry_azure():
+    entry = {"azure": {"litellm_credentials": "my-cred"}}
+    assert _extract_credential_from_entry(entry) == "my-cred"
+
+
+def test_extract_credential_from_entry_no_credential():
+    entry = {"azure": {"some_other_key": "value"}}
+    assert _extract_credential_from_entry(entry) is None
+
+
+def test_extract_credential_from_entry_empty():
+    assert _extract_credential_from_entry({}) is None
+
+
+def test_extract_credential_from_entry_non_dict_value():
+    entry = {"azure": "not-a-dict"}
+    assert _extract_credential_from_entry(entry) is None
+
+
+def test_extract_credential_from_entry_non_dict_entry():
+    """Non-dict entry (e.g. string) should return None, not crash."""
+    assert _extract_credential_from_entry("my-cred-name") is None
+    assert _extract_credential_from_entry(["a", "list"]) is None
+    assert _extract_credential_from_entry(42) is None
+
+
+# --- Unit tests for _resolve_credential_from_model_config ---
+
+
+def test_resolve_project_model_specific_wins():
+    project_config = {
+        "gpt-4": {"azure": {"litellm_credentials": "proj-gpt4"}},
+        "defaultconfig": {"azure": {"litellm_credentials": "proj-default"}},
+    }
+    team_config = {
+        "gpt-4": {"azure": {"litellm_credentials": "team-gpt4"}},
+        "defaultconfig": {"azure": {"litellm_credentials": "team-default"}},
+    }
+    result = _resolve_credential_from_model_config(
+        "gpt-4", project_config, team_config
+    )
+    assert result == "proj-gpt4"
+
+
+def test_resolve_project_default_wins_over_team():
+    project_config = {
+        "defaultconfig": {"azure": {"litellm_credentials": "proj-default"}},
+    }
+    team_config = {
+        "gpt-4": {"azure": {"litellm_credentials": "team-gpt4"}},
+        "defaultconfig": {"azure": {"litellm_credentials": "team-default"}},
+    }
+    result = _resolve_credential_from_model_config(
+        "gpt-4", project_config, team_config
+    )
+    assert result == "proj-default"
+
+
+def test_resolve_team_model_specific_wins_over_team_default():
+    team_config = {
+        "gpt-4": {"azure": {"litellm_credentials": "team-gpt4"}},
+        "defaultconfig": {"azure": {"litellm_credentials": "team-default"}},
+    }
+    result = _resolve_credential_from_model_config("gpt-4", None, team_config)
+    assert result == "team-gpt4"
+
+
+def test_resolve_team_default_used_as_fallback():
+    team_config = {
+        "defaultconfig": {"azure": {"litellm_credentials": "team-default"}},
+    }
+    result = _resolve_credential_from_model_config("gpt-3.5", None, team_config)
+    assert result == "team-default"
+
+
+def test_resolve_no_match_returns_none():
+    result = _resolve_credential_from_model_config("gpt-4", None, None)
+    assert result is None
+
+
+def test_resolve_empty_configs_returns_none():
+    result = _resolve_credential_from_model_config("gpt-4", {}, {})
+    assert result is None
+
+
+def test_resolve_model_not_in_any_config():
+    project_config = {"gpt-4": {"azure": {"litellm_credentials": "x"}}}
+    result = _resolve_credential_from_model_config("gpt-3.5", project_config, None)
+    assert result is None
+
+
+# --- Integration tests for _apply_credential_overrides_from_model_config ---
+
+
+def test_apply_overrides_project_model_specific(setup_test_credentials):
+    """Scenario 2: Hotel Rec App -> gpt-4-vision -> project model-specific."""
+    data = {"model": "gpt-4-vision"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "defaultconfig": {
+                    "azure": {"litellm_credentials": "hotel-azure-eastus"}
+                },
+                "gpt-4": {"azure": {"litellm_credentials": "hotel-azure-westus"}},
+            }
+        },
+        project_metadata={
+            "model_config": {
+                "defaultconfig": {
+                    "azure": {"litellm_credentials": "hotel-rec-azure"}
+                },
+                "gpt-4-vision": {
+                    "azure": {"litellm_credentials": "hotel-rec-vision"}
+                },
+            }
+        },
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert data["api_base"] == "https://hotel-rec-vision.openai.azure.com/"
+    assert data["api_key"] == "key-hotel-rec-vision"
+    assert data["api_version"] == "2024-06-01"
+
+
+def test_apply_overrides_project_default(setup_test_credentials):
+    """Scenario 1: Hotel Rec App -> gpt-4 -> project default."""
+    data = {"model": "gpt-4"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "defaultconfig": {
+                    "azure": {"litellm_credentials": "hotel-azure-eastus"}
+                },
+                "gpt-4": {"azure": {"litellm_credentials": "hotel-azure-westus"}},
+            }
+        },
+        project_metadata={
+            "model_config": {
+                "defaultconfig": {
+                    "azure": {"litellm_credentials": "hotel-rec-azure"}
+                },
+                "gpt-4-vision": {
+                    "azure": {"litellm_credentials": "hotel-rec-vision"}
+                },
+            }
+        },
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert data["api_base"] == "https://hotel-rec-app.openai.azure.com/"
+    assert data["api_key"] == "key-hotel-rec"
+
+
+def test_apply_overrides_team_model_specific(setup_test_credentials):
+    """Scenario 4: Hotel Review App -> gpt-4 -> team model-specific."""
+    data = {"model": "gpt-4"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "defaultconfig": {
+                    "azure": {"litellm_credentials": "hotel-azure-eastus"}
+                },
+                "gpt-4": {"azure": {"litellm_credentials": "hotel-azure-westus"}},
+            }
+        },
+        project_metadata={},
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert data["api_base"] == "https://hotel-westus.openai.azure.com/"
+    assert data["api_key"] == "key-hotel-westus"
+
+
+def test_apply_overrides_team_default(setup_test_credentials):
+    """Scenario 3: Hotel Review App -> gpt-3.5 -> team default."""
+    data = {"model": "gpt-3.5"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "defaultconfig": {
+                    "azure": {"litellm_credentials": "hotel-azure-eastus"}
+                },
+                "gpt-4": {"azure": {"litellm_credentials": "hotel-azure-westus"}},
+            }
+        },
+        project_metadata={},
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert data["api_base"] == "https://hotel-eastus.openai.azure.com/"
+    assert data["api_key"] == "key-hotel-eastus"
+
+
+def test_apply_overrides_no_config(setup_test_credentials):
+    """Scenario 6: No model_config anywhere -> data unchanged."""
+    data = {"model": "gpt-4"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={},
+        project_metadata={},
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert "api_base" not in data
+    assert "api_key" not in data
+
+
+def test_apply_overrides_clientside_credentials_take_precedence(
+    setup_test_credentials,
+):
+    """Clientside api_base/api_key in data should block model_config override."""
+    data = {
+        "model": "gpt-4",
+        "api_base": "https://my-custom-endpoint.openai.azure.com/",
+        "api_key": "my-custom-key",
+    }
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "defaultconfig": {
+                    "azure": {"litellm_credentials": "hotel-azure-eastus"}
+                }
+            }
+        },
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert data["api_base"] == "https://my-custom-endpoint.openai.azure.com/"
+    assert data["api_key"] == "my-custom-key"
+
+
+def test_apply_overrides_missing_credential_name(setup_test_credentials):
+    """model_config references a credential that doesn't exist -> no override."""
+    data = {"model": "gpt-4"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "gpt-4": {
+                    "azure": {"litellm_credentials": "nonexistent-credential"}
+                }
+            }
+        },
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert "api_base" not in data
+    assert "api_key" not in data
+
+
+def test_apply_overrides_api_version_only_if_present(setup_test_credentials):
+    """api_version should only be set if the credential contains it."""
+    data = {"model": "gpt-3.5"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "defaultconfig": {
+                    "azure": {"litellm_credentials": "hotel-azure-eastus"}
+                }
+            }
+        },
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert data["api_base"] == "https://hotel-eastus.openai.azure.com/"
+    assert data["api_key"] == "key-hotel-eastus"
+    assert "api_version" not in data
+
+
+def test_apply_overrides_no_model_in_data(setup_test_credentials):
+    """No model in request data -> skip override."""
+    data = {"messages": [{"role": "user", "content": "hello"}]}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "defaultconfig": {
+                    "azure": {"litellm_credentials": "some-cred"}
+                }
+            }
+        },
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert "api_base" not in data
+
+
+def test_apply_overrides_none_metadata(setup_test_credentials):
+    """None metadata on both team and project -> skip override."""
+    data = {"model": "gpt-4"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata=None,
+        project_metadata=None,
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert "api_base" not in data
+
+
+def test_apply_overrides_clientside_api_version_preserved(setup_test_credentials):
+    """Clientside api_version should not be overwritten by credential."""
+    data = {"model": "gpt-4-vision", "api_version": "2025-01-01"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "gpt-4-vision": {
+                    "azure": {"litellm_credentials": "hotel-rec-vision"}
+                }
+            }
+        },
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    # api_base and api_key should be set from credential
+    assert data["api_base"] == "https://hotel-rec-vision.openai.azure.com/"
+    assert data["api_key"] == "key-hotel-rec-vision"
+    # api_version should be preserved from the request, not overwritten
+    assert data["api_version"] == "2025-01-01"
+
+
+def test_resolve_non_dict_model_config_ignored():
+    """Non-dict model_config (e.g. string) should be safely skipped."""
+    result = _resolve_credential_from_model_config("gpt-4", "not-a-dict", None)
+    assert result is None
+
+    result = _resolve_credential_from_model_config(
+        "gpt-4", None, ["also", "not", "a", "dict"]
+    )
+    assert result is None
+
+    # Valid config still works alongside invalid one
+    result = _resolve_credential_from_model_config(
+        "gpt-4",
+        "invalid",
+        {"gpt-4": {"azure": {"litellm_credentials": "valid-cred"}}},
+    )
+    assert result == "valid-cred"
+
+
+def test_resolve_pre_alias_model_name_fallback():
+    """model_config keyed on pre-alias name should match after alias resolution."""
+    team_config = {
+        "gpt-4": {"azure": {"litellm_credentials": "team-gpt4"}},
+    }
+    # Post-alias name doesn't match, but pre-alias does (team scope)
+    result = _resolve_credential_from_model_config(
+        "azure/gpt-4-0613", None, team_config, pre_alias_model_name="gpt-4"
+    )
+    assert result == "team-gpt4"
+
+    # Same test for project scope
+    project_config = {
+        "gpt-4": {"azure": {"litellm_credentials": "proj-gpt4"}},
+    }
+    result = _resolve_credential_from_model_config(
+        "azure/gpt-4-0613", project_config, None, pre_alias_model_name="gpt-4"
+    )
+    assert result == "proj-gpt4"
+
+
+def test_resolve_post_alias_name_takes_priority():
+    """Post-alias (resolved) name should be tried before pre-alias name."""
+    team_config = {
+        "gpt-4": {"azure": {"litellm_credentials": "pre-alias-cred"}},
+        "gpt-4o-team-1": {"azure": {"litellm_credentials": "post-alias-cred"}},
+    }
+    # Team scope
+    result = _resolve_credential_from_model_config(
+        "gpt-4o-team-1", None, team_config, pre_alias_model_name="gpt-4"
+    )
+    assert result == "post-alias-cred"
+
+    # Project scope
+    result = _resolve_credential_from_model_config(
+        "gpt-4o-team-1", team_config, None, pre_alias_model_name="gpt-4"
+    )
+    assert result == "post-alias-cred"
+
+
+def test_apply_overrides_with_alias(setup_test_credentials):
+    """Credential override should work when model name was changed by alias."""
+    # Simulate: user called "my-gpt4", alias resolved to "azure/gpt-4-custom"
+    # model_config is keyed on "my-gpt4" (the pre-alias name)
+    data = {"model": "azure/gpt-4-custom"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "my-gpt4": {"azure": {"litellm_credentials": "hotel-azure-eastus"}},
+            }
+        },
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data,
+        user_api_key_dict=user_api_key_dict,
+        pre_alias_model_name="my-gpt4",
+    )
+    assert data["api_base"] == "https://hotel-eastus.openai.azure.com/"
+    assert data["api_key"] == "key-hotel-eastus"
+
+
+def test_apply_overrides_feature_flag_disabled_by_default():
+    """Feature flag defaults to False — credential overrides are inert until explicitly enabled."""
+    assert litellm.enable_model_config_credential_overrides is False
+    data = {"model": "gpt-4"}
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test-key",
+        team_metadata={
+            "model_config": {
+                "gpt-4": {"azure": {"litellm_credentials": "hotel-azure-eastus"}}
+            }
+        },
+    )
+    _apply_credential_overrides_from_model_config(
+        data=data, user_api_key_dict=user_api_key_dict
+    )
+    assert "api_base" not in data
+    assert "api_key" not in data
+
+
+def test_extract_credential_provider_hint_prefers_exact_match():
+    """Provider hint selects the correct provider in a multi-provider entry."""
+    entry = {
+        "openai": {"litellm_credentials": "openai-cred"},
+        "azure": {"litellm_credentials": "azure-cred"},
+    }
+    # With provider hint, should pick the exact match
+    assert _extract_credential_from_entry(entry, provider="azure") == "azure-cred"
+    assert _extract_credential_from_entry(entry, provider="openai") == "openai-cred"
+
+    # Without provider hint, falls back to first key (insertion order)
+    result = _extract_credential_from_entry(entry)
+    assert result in ("openai-cred", "azure-cred")
+
+    # Unknown provider falls back to first available
+    result = _extract_credential_from_entry(entry, provider="bedrock")
+    assert result in ("openai-cred", "azure-cred")
+
+
+def test_resolve_provider_hint_from_model_name():
+    """Provider prefix in model name (e.g. azure/gpt-4) threads through to entry extraction."""
+    config = {
+        "gpt-4": {
+            "openai": {"litellm_credentials": "openai-cred"},
+            "azure": {"litellm_credentials": "azure-cred"},
+        },
+    }
+    # Model name "azure/gpt-4" -> provider="azure" -> should prefer azure-cred
+    # But _resolve_credential_from_model_config tries "azure/gpt-4" first (no match),
+    # then falls to defaultconfig (no match). So we need to use pre_alias_model_name.
+    result = _resolve_credential_from_model_config(
+        "azure/gpt-4", config, None, pre_alias_model_name="gpt-4", provider="azure"
+    )
+    assert result == "azure-cred"
